@@ -58,7 +58,8 @@ Press **Q** in the preview window to quit.
 
 ## Notes
 - Works with **OBS Virtual Camera** (`--cam 6` on this system).  
-- Works with **PS3 Eye** at high frame rates (try `--api dshow --cam 0`).  
+- Works with **PS3 Eye** at high frame rates (try `--api dshow --cam 1`).  
+- Works with **Irium Webcam** at high frame rates (try `--api dshow --cam 0`).  
 - Motor commands are currently text only (`PAN <deg>  TILT <deg>`). Replace with [pyserial](https://pythonhosted.org/pyserial/) writes when connecting real hardware.
 
 ---
