@@ -97,12 +97,8 @@ class PD1D:
         self.prev_err = err
         return self.kp * err + self.kd * d
 
-# ------------------- MotorConsole (clean new window, no file paths) -------------
+# ------------------- MotorConsole (split window) -------------
 class MotorConsole:
-    """
-    Opens a separate Windows console window to display motor output.
-    If unavailable (non-Windows or failure), falls back to printing in the current console.
-    """
     def __init__(self, enable_split: bool = False, queue_size: int = 256):
         self.enable_requested = enable_split
         self.proc: Optional[subprocess.Popen] = None
@@ -281,7 +277,6 @@ class CamReader:
             pass
 
 class MJPEGStream:
-    """Minimal thread-safe MJPEG broadcaster. Call publish(jpg_bytes) from main loop."""
     def __init__(self, fps=15):
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -313,8 +308,8 @@ class MJPEGStream:
 # ------------------- Web Remote (phone) -----------------------------------------
 class WebRemote:
     """
-    Lightweight Flask server in a background thread.
-    Exposes manual control & scan for pan/tilt + optional camera MJPEG.
+    Flask server in a background thread.
+    Adds Xbox toggle, manual toggle, scan, center, and MJPEG stream.
     """
     def __init__(self, port: int, has_tilt: bool):
         from flask import Flask, request, jsonify, Response
@@ -328,21 +323,19 @@ class WebRemote:
 
         # shared state
         self.lock = threading.Lock()
-        self.manual = True           # always start in Manual
+        self.manual = True           # Manual vs Auto
+        self.xbox = False            # NEW: Xbox enable flag
         self.scan = False
         self.scan_speed = 25.0       # deg/s
         self.scan_range = (-80.0, 80.0)
         self.scan_dir = 1.0
-        self.t_pan = 0.0
-        self.t_tilt = 10.0
+        self.t_pan = 0.0             # UI target pan in degrees (-90..+90)
+        self.t_tilt = 10.0           # UI target tilt in degrees (-5..+35)
         self.exit_requested = False
-        self.streamer = MJPEGStream(fps=15)  # 10–20 fps is plenty for phone preview
+        self.streamer = MJPEGStream(fps=15)
 
-        # figure out LAN IP once & print ONCE
         self.server_addr = f"http://{self._get_local_ip()}:{self.port}"
-
         self._build_app()
-
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -390,6 +383,7 @@ class WebRemote:
           <div class="row">
             <span>Mode:</span>
             <button id="modeBtn" class="toggle">Manual</button>
+            <button id="xboxBtn" class="toggle">Xbox: Off</button>
           </div>
 
           <div class="row">
@@ -413,13 +407,13 @@ class WebRemote:
 
           <div class="row">
             <button id="camToggle" class="secondary">Show Camera</button>
-        </div>
-        <div class="row" id="camRow" style="display:none;">
+          </div>
+          <div class="row" id="camRow" style="display:none;">
             <img id="camImg" src="/stream" style="width:100%;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,0.15);" />
-        </div>
-        <div class="row small">
+          </div>
+          <div class="row small">
             <div>Tip: Add to Home Screen for full‑screen remote.</div>
-        </div>
+          </div>
 
         </div>
 
@@ -432,6 +426,7 @@ class WebRemote:
         const tiltVal = document.getElementById('tiltVal');
         const scanBtn = document.getElementById('scanBtn');
         const modeBtn = document.getElementById('modeBtn');
+        const xboxBtn = document.getElementById('xboxBtn');
 
         if (tiltEnabled) tiltBlock.style.display = 'block';
 
@@ -474,6 +469,11 @@ class WebRemote:
           modeBtn.textContent = s.manual ? 'Manual' : 'Auto';
         });
 
+        xboxBtn.addEventListener('click', async () => {
+          let s = await post('/api/xbox/toggle', {});
+          xboxBtn.textContent = s.xbox ? 'Xbox: On' : 'Xbox: Off';
+        });
+
         document.getElementById('killBtn').addEventListener('click', async () => {
           try {
             await post('/api/exit', {});
@@ -488,6 +488,7 @@ class WebRemote:
           if (tiltEnabled) { tilt.value = s.t_tilt; tiltVal.textContent = s.t_tilt; }
           modeBtn.textContent = s.manual ? 'Manual' : 'Auto';
           scanning = s.scan; scanBtn.textContent = scanning ? 'Stop Scan' : 'Start Scan';
+          xboxBtn.textContent = s.xbox ? 'Xbox: On' : 'Xbox: Off';
         });
 
         const camToggle = document.getElementById('camToggle');
@@ -513,9 +514,8 @@ class WebRemote:
         def api_status():
             with self.lock:
                 return self.jsonify(
-                    ok=True, manual=self.manual, scan=self.scan,
-                    t_pan=self.t_pan, t_tilt=self.t_tilt,
-                    exit=self.exit_requested
+                    ok=True, manual=self.manual, xbox=self.xbox, scan=self.scan,
+                    t_pan=self.t_pan, t_tilt=self.t_tilt, exit=self.exit_requested
                 )
 
         @app.post("/api/mode/toggle")
@@ -523,6 +523,12 @@ class WebRemote:
             with self.lock:
                 self.manual = not self.manual
             return self.jsonify(ok=True, manual=self.manual)
+
+        @app.post("/api/xbox/toggle")
+        def api_toggle_xbox():
+            with self.lock:
+                self.xbox = not self.xbox
+            return self.jsonify(ok=True, xbox=self.xbox)
 
         @app.post("/api/set")
         def api_set():
@@ -579,7 +585,7 @@ class WebRemote:
     def get_state(self):
         with self.lock:
             return dict(
-                manual=self.manual, scan=self.scan,
+                manual=self.manual, xbox=self.xbox, scan=self.scan,
                 scan_speed=self.scan_speed, scan_range=self.scan_range,
                 scan_dir=self.scan_dir, t_pan=self.t_pan, t_tilt=self.t_tilt,
                 exit=self.exit_requested
@@ -593,24 +599,17 @@ class WebRemote:
 
 # ----------------------- Xbox Controller wrapper --------------------------------
 class XboxController:
-    """
-    Lightweight pygame-based reader for an Xbox (XInput) controller.
-    Maps left stick: X -> pan, Y -> tilt.
-    """
     def __init__(self, index=0, deadzone=0.15, expo=0.35, invert_x=False, invert_y=True):
-        # import pygame lazily so the dependency is only required when used
         try:
             import pygame
         except ImportError as e:
-            raise RuntimeError(
-                "pygame is required for --xbox-control. Install with: pip install pygame"
-            ) from e
+            raise RuntimeError("pygame is required for --xbox-control. pip install pygame") from e
         self.pygame = pygame
         pygame.init()
         pygame.joystick.init()
 
         if pygame.joystick.get_count() <= index:
-            raise RuntimeError(f"No joystick at index {index}. Connected count: {pygame.joystick.get_count()}")
+            raise RuntimeError(f"No joystick at index {index}. Connected: {pygame.joystick.get_count()}")
 
         self.js = pygame.joystick.Joystick(index)
         self.js.init()
@@ -620,35 +619,26 @@ class XboxController:
         self.invert_x = bool(invert_x)
         self.invert_y = bool(invert_y)
 
-        name = self.js.get_name()
-        print(f"[xbox] Using controller: {name} (index {index})")
+        print(f"[xbox] Using controller: {self.js.get_name()} (index {index})")
 
     def _shape(self, v):
-        # deadzone
         if abs(v) < self.deadzone:
             return 0.0
-        # re-scale post-deadzone to 0..1
         sign = 1.0 if v >= 0 else -1.0
         mag = (abs(v) - self.deadzone) / (1.0 - self.deadzone)
         mag = np.clip(mag, 0.0, 1.0)
-        # expo curve for finer control near center
-        shaped = sign * ( (1 - self.expo) * mag + self.expo * (mag ** 3) )
+        shaped = sign * ((1 - self.expo) * mag + self.expo * (mag ** 3))
         return float(np.clip(shaped, -1.0, 1.0))
 
     def read_axes(self):
-        # pump events to get fresh state
         self.pygame.event.pump()
         lx = self.js.get_axis(0)  # left stick X
         ly = self.js.get_axis(1)  # left stick Y
-        if self.invert_x:
-            lx = -lx
-        if self.invert_y:
-            ly = -ly
-        return self._shape(lx), self._shape(ly)
+        return self._shape(-lx if self.invert_x else lx), self._shape(-ly if self.invert_y else ly)
 
 # ---------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Head tracking with motor commands + phone/web remote + optional Xbox control")
+    ap = argparse.ArgumentParser(description="Head tracking + motor commands + web remote + Xbox toggle")
     ap.add_argument("--cam", type=int, default=0, help="Camera index")
     ap.add_argument("--api", type=str, default="dshow", choices=list(API_MAP.keys()))
     ap.add_argument("--flip", action="store_true", help="Mirror the preview")
@@ -688,23 +678,23 @@ def main():
     ap.add_argument("--threaded-capture", action="store_true", help="Read frames on a background thread")
     ap.add_argument("--detect-scale", type=float, default=1.0, help="Scale factor for detection (e.g., 0.5)")
 
-    # NEW: no preview window
+    # preview toggle
     ap.add_argument("--no-preview", action="store_true", help="Disable camera preview window")
 
-    # NEW: phone/web remote
+    # web remote
     ap.add_argument("--web-remote", action="store_true", help="Enable phone/web remote")
     ap.add_argument("--web-port", type=int, default=8080, help="Port for web remote (default 8080)")
 
-    # NEW: allow running without opening a camera device
-    ap.add_argument("--no-camera", action="store_true", help="Do not open any camera (headless or Xbox-only)")
+    # allow running without camera (headless/manual-only)
+    ap.add_argument("--no-camera", action="store_true", help="Do not open any camera")
 
-    # NEW: Xbox controller options
-    ap.add_argument("--xbox-control", action="store_true", help="Use Xbox controller (USB) to drive pan/tilt")
-    ap.add_argument("--xbox-index", type=int, default=0, help="Joystick index (default 0)")
-    ap.add_argument("--xbox-deadzone", type=float, default=0.15, help="Controller stick deadzone (0..1)")
-    ap.add_argument("--xbox-expo", type=float, default=0.35, help="Expo curve (0=linear, higher=more fine center control)")
-    ap.add_argument("--xbox-invert-x", action="store_true", help="Invert pan axis")
-    ap.add_argument("--xbox-invert-y", action="store_true", help="Invert tilt axis (default behavior flips Y already)")
+    # Xbox controller
+    ap.add_argument("--xbox-control", action="store_true", help="Enable Xbox controller support")
+    ap.add_argument("--xbox-index", type=int, default=0)
+    ap.add_argument("--xbox-deadzone", type=float, default=0.15)
+    ap.add_argument("--xbox-expo", type=float, default=0.35)
+    ap.add_argument("--xbox-invert-x", action="store_true")
+    ap.add_argument("--xbox-invert-y", action="store_true")
 
     args = ap.parse_args()
 
@@ -717,11 +707,11 @@ def main():
                 deadzone=args.xbox_deadzone,
                 expo=args.xbox_expo,
                 invert_x=args.xbox_invert_x,
-                invert_y=not args.xbox_invert_y  # our wrapper default is invert_y=True; this flag flips that behavior
+                invert_y=not args.xbox_invert_y  # default invert Y (stick up = positive tilt target)
             )
         except Exception as e:
             print(f"[xbox] Failed to init controller: {e}")
-            raise SystemExit(1)
+            # continue without xbox
 
     # Camera init (optional)
     cap = None
@@ -729,8 +719,6 @@ def main():
         cap = open_cam(args.cam, API_MAP[args.api])
         if not cap:
             raise SystemExit("Could not open camera. If using OBS, Start Virtual Camera; if PS3 Eye, try --api dshow and your index.")
-
-        # Request fast camera path
         if args.fourcc != "any":
             fourcc = cv2.VideoWriter_fourcc(*FOURCC_MAP[args.fourcc])
             cap.set(cv2.CAP_PROP_FOURCC, fourcc)
@@ -741,8 +729,7 @@ def main():
 
     detector = None
     if not args.no_camera:
-        detector = mp_fd.FaceDetection(model_selection=args.model,
-                                       min_detection_confidence=args.min_conf)
+        detector = mp_fd.FaceDetection(model_selection=args.model, min_detection_confidence=args.min_conf)
 
     prev_box = None
     prev_time = time.time()
@@ -762,11 +749,8 @@ def main():
     last_printed_tilt = None
 
     motor = MotorConsole(enable_split=args.split_console)
-
-    # Optional threaded capture
     reader = CamReader(cap) if (cap is not None and args.threaded_capture) else None
 
-    # Web remote (optional)
     remote = None
     if args.web_remote:
         has_tilt = not args.pan_only
@@ -777,12 +761,7 @@ def main():
         except Exception as e:
             print(f"[web] Failed to start remote: {e}")
 
-    # Help text
-    if args.no_preview:
-        print("Headless mode: press Ctrl+C to stop.")
-    else:
-        print("Press Q to quit.")
-
+    print("Press Q to quit." if not args.no_preview else "Headless mode: press Ctrl+C to stop.")
     try:
         while True:
             # timing
@@ -790,7 +769,7 @@ def main():
             dt = max(1e-3, now - prev_time)
             prev_time = now
 
-            # Acquire frame if camera present
+            # capture
             frame = None
             if reader:
                 ok, frame = reader.get()
@@ -801,27 +780,24 @@ def main():
                 if not ok:
                     ok, frame = cap.read()
                     if not ok:
-                        print("Frame grab failed; continuing...")
                         time.sleep(0.005)
 
-            # ------------- Remote state (manual/scan) -----------------
-            manual = False
+            # remote state
+            manual = True
+            xbox_on = False
             scan_enabled = False
             t_pan = 0.0
             t_tilt = 10.0
             if remote:
                 s = remote.get_state()
                 manual = s["manual"]
+                xbox_on = s.get("xbox", False) and (xbox is not None)
                 scan_enabled = s["scan"]
                 t_pan = float(s["t_pan"])
                 t_tilt = float(s["t_tilt"])
-
-                # exit check from phone
                 if s.get("exit"):
                     break
-
-                # scan logic: bounce target within range
-                if scan_enabled and manual:
+                if scan_enabled and manual and not xbox_on:
                     lo, hi = s["scan_range"]
                     spd = s["scan_speed"]
                     t_pan += s["scan_dir"] * spd * dt
@@ -833,33 +809,28 @@ def main():
                         remote.set_state(scan_dir=+1.0)
                     remote.set_state(t_pan=t_pan)
 
-            # ------------- Xbox overrides targets (Manual) -------------
-            # If xbox-control is active, we force manual mode and generate targets from sticks.
-            if xbox is not None:
-                manual = True
-                lx, ly = xbox.read_axes()  # -1..+1 after shaping
-                # Map to the same UI-friendly ranges as the web remote sliders:
-                # pan slider is -90..+90, tilt slider is -5..+35
+            # if xbox enabled, stick drives targets (still Manual mode)
+            if manual and xbox_on:
+                lx, ly = xbox.read_axes() if xbox is not None else (0.0, 0.0)
                 t_pan = float(np.clip(lx * 90.0, -90.0, 90.0))
                 if not args.pan_only:
-                    t_tilt = float(np.clip(ly * 20.0 + 10.0, -5.0, 35.0))  # center around 10°, span ~40°
+                    t_tilt = float(np.clip(ly * 20.0 + 10.0, -5.0, 35.0))
+                if remote:
+                    # reflect live stick-derived targets into UI so sliders mirror motion
+                    remote.set_state(t_pan=t_pan, t_tilt=t_tilt)
 
-            # ----------------- Tracking / control ----------------------
+            # control
             head_cx = head_cy = None
-
             if not manual:
-                # AUTO: Face tracking if camera is available
+                # AUTO tracking
                 if frame is not None:
                     if args.flip:
                         frame = cv2.flip(frame, 1)
-
                     H, W = frame.shape[:2]
                     cx, cy = W / 2.0, H / 2.0
-
                     DS = float(args.detect_scale)
                     if DS <= 0.0 or DS > 1.0:
                         DS = 1.0
-
                     if DS != 1.0:
                         small = cv2.resize(frame, (0, 0), fx=DS, fy=DS, interpolation=cv2.INTER_LINEAR)
                         rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
@@ -867,9 +838,7 @@ def main():
                     else:
                         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         det_W, det_H = W, H
-
                     result = detector.process(rgb) if detector is not None else None
-
                     if result and result.detections:
                         det = max(result.detections, key=lambda d: d.score[0] if d.score else 0.0)
                         rel = det.location_data.relative_bounding_box
@@ -889,7 +858,6 @@ def main():
                         box_now = (x, y, w, h)
                         prev_box = ema_smooth(prev_box, box_now, alpha=args.smooth)
                         lost_counter = 0
-
                         if not args.no_preview:
                             cv2.rectangle(frame, (x, y), (x + w, y + h), (40, 220, 40), 2)
                             if prev_box is not None:
@@ -914,19 +882,13 @@ def main():
                     if head_cx is not None and head_cy is not None:
                         pan_err = (head_cx - cx)
                         tilt_err = (head_cy - cy)
-
-                        if abs(pan_err) < args.deadband_x:
-                            pan_err = 0.0
-                        if abs(tilt_err) < args.deadband_y:
-                            tilt_err = 0.0
-
+                        if abs(pan_err) < args.deadband_x: pan_err = 0.0
+                        if abs(tilt_err) < args.deadband_y: tilt_err = 0.0
                         pan_delta = pan_pd.step(pan_err, dt)
                         tilt_delta = tilt_pd.step(tilt_err, dt)
-
                         max_step = args.rate_limit * dt
                         pan_delta = float(np.clip(pan_delta, -max_step, max_step))
                         tilt_delta = float(np.clip(tilt_delta, -max_step, max_step))
-
                         pan_angle = float(np.clip(pan_angle + pan_delta, args.min_pan, args.max_pan))
                         tilt_angle = float(np.clip(tilt_angle + tilt_delta, args.min_tilt, args.max_tilt))
 
@@ -936,19 +898,16 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
             else:
-                # MANUAL MODE:
-                # If Xbox present, t_pan/t_tilt already set from sticks.
-                # Otherwise, use web-remote sliders (if remote enabled).
+                # MANUAL mode (either Xbox or sliders/scan)
                 max_step = args.rate_limit * dt
 
-                # Map pan: slider is -90..+90, servo expects min_pan..max_pan
+                # compute servo targets from UI targets
                 pan_target_servo = map_range(t_pan, -90.0, 90.0, args.min_pan, args.max_pan)
                 pan_target_servo = float(np.clip(pan_target_servo, args.min_pan, args.max_pan))
                 dpan = float(np.clip(pan_target_servo - pan_angle, -max_step, max_step))
                 pan_angle = float(np.clip(pan_angle + dpan, args.min_pan, args.max_pan))
 
                 if not args.pan_only:
-                    # Tilt slider is -5..+35
                     tilt_target_servo = map_range(t_tilt, -5.0, 35.0, args.min_tilt, args.max_tilt)
                     tilt_target_servo = float(np.clip(tilt_target_servo, args.min_tilt, args.max_tilt))
                     dtilt = float(np.clip(tilt_target_servo - tilt_angle, -max_step, max_step))
@@ -956,11 +915,11 @@ def main():
 
                 if args.show_fps and not args.no_preview and frame is not None:
                     fps = 1.0 / dt if dt > 0 else 0.0
-                    mode = "XBOX" if xbox is not None else "MANUAL"
+                    mode = "XBOX" if xbox_on else "MANUAL"
                     cv2.putText(frame, f"{fps:4.1f} FPS ({mode})", (10, 24),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
 
-            # ------------- output motor commands (print only on change) -------------
+            # output motor commands (print only on change)
             now2 = time.time()
             if (now2 - last_print) >= print_interval:
                 last_print = now2
@@ -976,7 +935,7 @@ def main():
                         last_printed_pan = pan_i
                         last_printed_tilt = tilt_i
 
-            # --- MJPEG publish to phone UI (only if we have frames) ---
+            # MJPEG publish
             if remote and frame is not None:
                 sf = frame
                 h, w = sf.shape[:2]
@@ -988,10 +947,9 @@ def main():
                 if ok_jpg:
                     remote.streamer.publish(jpg.tobytes())
 
-            # Preview / headless
+            # Preview
             if not args.no_preview and frame is not None:
-                title = "Head Tracking + Motor Commands + Web Remote + Xbox"
-                cv2.imshow(title, frame)
+                cv2.imshow("Head Tracking + Motor + Web Remote + Xbox", frame)
                 if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q')):
                     break
             else:
